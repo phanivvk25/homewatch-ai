@@ -1,0 +1,15 @@
+{
+  "name": "hnt-openapi-tools",
+  "private": true,
+  "description": "Pinned tooling for API contract linting and client generation",
+  "license": "UNLICENSED",
+  "scripts": {
+    "lint": "spectral lint -r ../../api/.spectral.yaml ../../api/agent.openapi.yaml ../../api/cloud.openapi.yaml --fail-severity=warn && cd ../.. && redocly lint"
+  },
+  "devDependencies": {
+    "@openapitools/openapi-generator-cli": "2.25.0",
+    "@redocly/cli": "1.34.5",
+    "@stoplight/spectral-cli": "6.15.0",
+    "@stoplight/spectral-owasp-ruleset": "2.0.1"
+  }
+}

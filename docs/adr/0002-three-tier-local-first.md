@@ -1,5 +1,5 @@
 # ADR-0002: Three-tier, local-first architecture
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 Mobile OS sandboxes prevent a phone from observing other devices' traffic. Observation needs a component on the LAN that devices send DNS to. DNS history is highly sensitive (DPDP), so the less of it leaves the home, the smaller the regulatory and breach surface.

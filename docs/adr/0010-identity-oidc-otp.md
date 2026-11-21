@@ -1,5 +1,5 @@
 # ADR-0010: Identity: self-hosted OIDC (OpenIddict), PKCE, OTP; account optional in local mode
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 Requirements: OAuth 2.0/OIDC with PKCE, access tokens ≤15 min, rotating refresh tokens, device binding, mobile OTP + email. Data localization favours India-hosted identity. Azure AD B2C is closed to new customers, and Entra External ID doesn't guarantee India data residency. TRAI requires DLT registration for commercial SMS.

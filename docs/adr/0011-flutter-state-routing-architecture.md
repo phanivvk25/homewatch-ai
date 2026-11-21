@@ -1,5 +1,5 @@
 # ADR-0011: Flutter: Riverpod, go_router, Clean Architecture
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 We need testable layers, DI, offline-first streams, and good performance on 2–3 GB RAM devices.

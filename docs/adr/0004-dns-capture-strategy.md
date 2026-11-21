@@ -1,5 +1,5 @@
 # ADR-0004: DNS capture strategy
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 To attribute domains to devices, the agent must receive each device's DNS queries with the client's real source IP. Indian ISP routers vary:

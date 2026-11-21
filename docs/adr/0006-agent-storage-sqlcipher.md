@@ -1,5 +1,5 @@
 # ADR-0006: Agent storage: SQLite + SQLCipher
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 The agent needs embedded, low-RAM, crash-safe storage with AES-256 at rest. Write load: about 30 devices × roughly 2–10k queries/day = up to 300k rows/day.

@@ -1,5 +1,5 @@
 # ADR-0007: Agent–app trust: QR pairing, household CA, mTLS
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 The app must trust only the real agent, and the agent must serve only paired household devices, on a LAN that may contain hostile devices. There is no public PKI for `192.168.x.x`.

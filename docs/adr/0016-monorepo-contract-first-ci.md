@@ -1,5 +1,5 @@
 # ADR-0016: Monorepo, contract-first OpenAPI 3.1, GitHub Actions
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Decision
 - Layout: `/app`, `/agent`, `/backend`, `/infra`, `/docs`, `/api` (OpenAPI 3.1 specs, the source of truth), `/tools`.

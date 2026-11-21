@@ -1,0 +1,10 @@
+# oapi-codegen config for the agent local API (strict net/http server + models).
+# Input is the derived OpenAPI 3.0.3 document (see tools/openapi/downconvert.py).
+package: agentapi
+generate:
+  std-http-server: true
+  strict-server: true
+  models: true
+output-options:
+  skip-prune: false
+output: agent/internal/api/agentapi/agent.gen.go

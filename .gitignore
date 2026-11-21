@@ -1,0 +1,17 @@
+# Tooling
+node_modules/
+/build/
+__pycache__/
+*.pyc
+
+# Secrets / local config (never commit)
+.env
+.env.*
+*.pem
+*.key
+*.jks
+*.keystore
+key.properties
+google-services.json
+GoogleService-Info.plist
+.claude/settings.local.json

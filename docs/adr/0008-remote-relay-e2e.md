@@ -1,5 +1,5 @@
 # ADR-0008: Remote access: outbound relay with Noise IK end-to-end tunnel
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 Remote access must work behind CGNAT (common on Jio and Airtel), use no port forwarding, and keep the relay blind to DNS and device data.

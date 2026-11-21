@@ -1,5 +1,5 @@
 # ADR-0012: Flutter local storage: drift + SQLCipher, bounded cache
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Decision
 - **drift** over SQLCipher (through `sqlite3` with SQLCipher build options / `sqlcipher_flutter_libs`). The 256-bit key is random and stored in `flutter_secure_storage` (Android Keystore-backed `EncryptedSharedPreferences` replacement with AES-GCM + Keystore key; iOS Keychain `WhenUnlockedThisDeviceOnly`).

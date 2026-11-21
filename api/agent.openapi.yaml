@@ -1,0 +1,2345 @@
+openapi: 3.1.0
+info:
+  title: Home Network Tracker Agent Local API
+  version: 1.0.0
+  summary: LAN API served by the Home Agent to paired apps.
+  description: |
+    Served by the Home Agent on the LAN at `https://<agent-ip>:8443` (TLS 1.3 only).
+
+    **Transports.** The same API is reachable in two ways:
+    1. **LAN:** mutual TLS. The client cert is issued by the household CA at pairing, and the agent cert is SPKI-pinned by the app.
+    2. **Remote:** HTTP/1.1 messages carried inside a Noise_IK tunnel over the cloud relay (see `cloud.openapi.yaml`, `/v1/relay/tunnel`). The relay never sees plaintext.
+
+    **Authorisation.** Every operation except `POST /v1/pair` requires a valid, non-revoked client certificate.
+    The minimum role is given by `x-required-role` (`viewer` < `member` < `owner`). The agent reads the role from its member table, never from certificate fields.
+
+    **Conventions.**
+    - Timestamps are RFC 3339 UTC.
+    - List endpoints use opaque keyset cursors (`cursor`, `next_cursor`) with `limit` ≤ 200.
+    - Errors use RFC 9457 `application/problem+json`.
+    - Mutating requests accept an `Idempotency-Key` header (UUID). Replays within 24 h return the original response.
+    - MAC addresses are masked unless `reveal=true` is requested by an `owner`. Every reveal is audited.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+  contact:
+    name: Home Network Tracker Security
+    url: https://github.com/phanivvk25/homewatch-ai/security/policy
+servers:
+  - url: https://{agentHost}:8443
+    description: Local Home Agent on the household LAN (production; also reachable tunnelled through the relay)
+    variables:
+      agentHost:
+        default: hnt-agent.local
+        description: Agent IP or mDNS name. The certificate is verified by SPKI pin, not hostname.
+    x-internal: false
+security:
+  - mtls: []
+tags:
+  - name: pairing
+    description: Pairing, invites, paired clients and certificates
+  - name: agent
+    description: Agent status, settings, updates and remote mode
+  - name: devices
+    description: Device inventory, merge and identifiers
+  - name: sessions
+    description: Connection history
+  - name: sites
+    description: Domains visited
+  - name: alerts
+    description: Alerts and alert rules
+  - name: profiles
+    description: Family member profiles
+  - name: privacy
+    description: Consent, export, erasure and audit
+  - name: sync
+    description: Offline-first delta sync
+
+paths:
+  /v1/pair:
+    post:
+      tags: [pairing]
+      operationId: pair
+      summary: Complete pairing using a one-time token from the QR code
+      description: |
+        This operation needs no client certificate. The caller has pinned the agent SPKI from the QR code.
+        `proof` = base64url(HMAC-SHA256(token_secret, csr_der ‖ noise_pub ‖ tls_exporter)),
+        where `tls_exporter` = TLS exporter value for label `EXPORTER-hnt-pairing`, 32 bytes.
+        Limits: 5 attempts per token and 20 per hour per source IP. Tokens are single-use and expire within 5 minutes.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PairRequest'}
+      responses:
+        '200':
+          description: Paired. Store the certificate and keys in secure storage.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PairResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401':
+          description: Token unknown, expired, used, or proof invalid
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/me:
+    get:
+      tags: [pairing]
+      operationId: getMe
+      summary: Identity and role of the calling client
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Caller identity
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Me'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/invites:
+    post:
+      tags: [pairing]
+      operationId: createInvite
+      summary: Create a one-time pairing token for a new member or viewer
+      description: The returned payload is rendered as a QR code by the owner's app. It expires in 5 minutes.
+      x-required-role: owner
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InviteRequest'}
+      responses:
+        '201':
+          description: Invite created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PairingQrPayload'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/members:
+    get:
+      tags: [pairing]
+      operationId: listMembers
+      summary: List household members and their paired clients
+      x-required-role: member
+      responses:
+        '200':
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Member'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/members/{memberId}:
+    parameters:
+      - $ref: '#/components/parameters/MemberId'
+    patch:
+      tags: [pairing]
+      operationId: updateMember
+      summary: Rename a member or change their role (not to or from owner)
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: {$ref: '#/components/schemas/MemberUpdate'}
+      responses:
+        '200':
+          description: Updated member
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Member'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [pairing]
+      operationId: removeMember
+      summary: Remove a member and revoke all their clients
+      x-required-role: owner
+      responses:
+        '204': {description: "Removed"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/clients/{clientId}:
+    parameters:
+      - $ref: '#/components/parameters/ClientId'
+    delete:
+      tags: [pairing]
+      operationId: revokeClient
+      summary: Revoke a paired app install (takes effect on next handshake, at most 1 s)
+      description: Owners can revoke any client. Members and viewers can revoke only their own.
+      x-required-role: viewer
+      responses:
+        '204': {description: "Revoked"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/certificates/renew:
+    post:
+      tags: [pairing]
+      operationId: renewCertificate
+      summary: Renew the caller's client certificate (allowed after 80% of its lifetime)
+      x-required-role: viewer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csr]
+              properties:
+                csr:
+                  type: string
+                  contentEncoding: base64
+                  description: DER-encoded PKCS#10 CSR (P-256)
+                  maxLength: 8192
+      responses:
+        '200':
+          description: New certificate. The old one remains valid until it expires.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CertificateBundle'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/agent:
+    get:
+      tags: [agent]
+      operationId: getAgentInfo
+      summary: Agent status, version, capture mode and health
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Agent information
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AgentInfo'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/settings:
+    get:
+      tags: [agent]
+      operationId: getSettings
+      summary: Household settings
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Settings
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Settings'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      tags: [agent]
+      operationId: updateSettings
+      summary: Update settings (JSON Merge Patch)
+      description: Shortening `retention_days` deletes older data within one hour.
+      x-required-role: owner
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: {$ref: '#/components/schemas/SettingsUpdate'}
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Settings'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/upstreams:
+    get:
+      tags: [agent]
+      operationId: listUpstreamPresets
+      summary: Built-in upstream DNS resolver presets
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Presets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/UpstreamPreset'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/remote:
+    get:
+      tags: [agent]
+      operationId: getRemoteStatus
+      summary: Remote-mode status
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Remote status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RemoteStatus'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/remote/enable:
+    post:
+      tags: [agent]
+      operationId: enableRemote
+      summary: Enroll the agent with the cloud relay (LAN only)
+      description: Rejected with 403 when the request arrives through the relay tunnel. Enabling remote access must happen on the LAN.
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RemoteEnableRequest'}
+      responses:
+        '200':
+          description: Enrolled and connected
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RemoteStatus'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: Relay rejected the enrollment or is unreachable
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+
+  /v1/remote/disable:
+    post:
+      tags: [agent]
+      operationId: disableRemote
+      summary: Disconnect from the relay and delete the relay credential
+      x-required-role: owner
+      responses:
+        '200':
+          description: Remote disabled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RemoteStatus'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/updates:
+    get:
+      tags: [agent]
+      operationId: getUpdateStatus
+      summary: Agent update status (last verified signed manifest)
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Update status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UpdateStatus'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/updates/apply:
+    post:
+      tags: [agent]
+      operationId: applyUpdate
+      summary: Apply the available verified update now (binary/OpenWrt installs only)
+      x-required-role: owner
+      responses:
+        '202':
+          description: Update started. The agent restarts and rolls back automatically on a failed health check.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409':
+          description: No update available, or the install type does not support self-update (Docker)
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/dashboard:
+    get:
+      tags: [sites]
+      operationId: getDashboard
+      summary: Devices online now, top sites today, new devices this week
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Dashboard
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Dashboard'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/devices:
+    get:
+      tags: [devices]
+      operationId: listDevices
+      summary: List devices
+      x-required-role: viewer
+      parameters:
+        - name: status
+          in: query
+          schema: {type: string, enum: [online, offline, all], default: all}
+        - name: profile_id
+          in: query
+          schema: {type: string, format: uuid, maxLength: 36}
+        - name: trusted
+          in: query
+          schema: {type: boolean}
+        - name: q
+          in: query
+          description: Case-insensitive match on name, vendor, hostname or IP
+          schema: {type: string, maxLength: 64}
+        - name: sort
+          in: query
+          schema: {type: string, enum: [last_seen, first_seen, name], default: last_seen}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Devices
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DevicePage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/devices/{deviceId}:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [devices]
+      operationId: getDevice
+      summary: Get a device
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/Reveal'
+      responses:
+        '200':
+          description: Device
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Device'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      tags: [devices]
+      operationId: updateDevice
+      summary: Rename, set type, assign profile, mark trusted (JSON Merge Patch)
+      x-required-role: member
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: {$ref: '#/components/schemas/DeviceUpdate'}
+      responses:
+        '200':
+          description: Updated device
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Device'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [devices]
+      operationId: deleteDevice
+      summary: Forget a device and all its sessions and queries
+      x-required-role: owner
+      responses:
+        '204': {description: "Deleted"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/devices/{deviceId}/identifiers:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [devices]
+      operationId: listDeviceIdentifiers
+      summary: MACs, hostnames and fingerprints associated with the device
+      x-required-role: member
+      parameters:
+        - $ref: '#/components/parameters/Reveal'
+      responses:
+        '200':
+          description: Identifiers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/DeviceIdentifier'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/devices/{deviceId}/merge:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    post:
+      tags: [devices]
+      operationId: mergeDevices
+      summary: Merge other devices into this one (undoable for 7 days)
+      x-required-role: member
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MergeRequest'}
+      responses:
+        '200':
+          description: Merged
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MergeResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/merges/{mergeId}/undo:
+    parameters:
+      - name: mergeId
+        in: path
+        required: true
+        schema: {type: string, format: uuid, maxLength: 36}
+    post:
+      tags: [devices]
+      operationId: undoMerge
+      summary: Undo a merge within its 7-day window
+      x-required-role: member
+      responses:
+        '200':
+          description: Undone. Returns the restored devices.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Device'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410':
+          description: Undo window expired
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/devices/{deviceId}/sessions:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [sessions]
+      operationId: listDeviceSessions
+      summary: Connection timeline for a device (newest first)
+      x-required-role: viewer
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Sessions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/sites:
+    get:
+      tags: [sites]
+      operationId: listSites
+      summary: Domains visited, grouped by registrable domain (eTLD+1)
+      description: |
+        Household-wide by default. Pass `device_id` or `profile_id` to narrow the results.
+        Sorted by `query_count` desc unless `sort=last_seen`. The `infrastructure` category is excluded unless `include_hidden=true`.
+      x-required-role: viewer
+      parameters:
+        - name: device_id
+          in: query
+          schema: {type: string, format: uuid, maxLength: 36}
+        - name: profile_id
+          in: query
+          schema: {type: string, format: uuid, maxLength: 36}
+        - name: category
+          in: query
+          style: form
+          explode: false
+          schema:
+            type: array
+            items: {$ref: '#/components/schemas/CategoryCode'}
+            maxItems: 100
+        - name: q
+          in: query
+          description: Substring match on the registrable domain or brand
+          schema: {type: string, maxLength: 64}
+        - name: include_hidden
+          in: query
+          schema: {type: boolean, default: false}
+        - name: sort
+          in: query
+          schema: {type: string, enum: [count, last_seen], default: count}
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Site summaries
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SitePage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/sites/{etld1}/category:
+    parameters:
+      - $ref: '#/components/parameters/Etld1'
+    put:
+      tags: [sites]
+      operationId: setSiteCategory
+      summary: Override the category of a registrable domain
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [category]
+              properties:
+                category: {$ref: '#/components/schemas/CategoryCode'}
+      responses:
+        '200':
+          description: Updated site
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Site'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [sites]
+      operationId: clearSiteCategory
+      summary: Remove the user override and revert to the bundled category
+      x-required-role: owner
+      responses:
+        '200':
+          description: Reverted site
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Site'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/queries:
+    get:
+      tags: [sites]
+      operationId: listQueries
+      summary: Raw DNS query log (newest first)
+      x-required-role: member
+      parameters:
+        - name: device_id
+          in: query
+          schema: {type: string, format: uuid, maxLength: 36}
+        - name: etld1
+          in: query
+          schema: {type: string, maxLength: 253}
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Queries
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/QueryPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/categories:
+    get:
+      tags: [sites]
+      operationId: listCategories
+      summary: Category taxonomy and the installed bundle version
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Categories
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bundle_version, items]
+                properties:
+                  bundle_version: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+                  bundle_updated_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Category'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/profiles:
+    get:
+      tags: [profiles]
+      operationId: listProfiles
+      summary: List family member profiles
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Profiles
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Profile'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [profiles]
+      operationId: createProfile
+      summary: Create a profile
+      description: Creating a profile with `is_minor=true` requires a `minor_parental_consent` consent record, which the app creates in the same flow.
+      x-required-role: owner
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProfileCreate'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Profile'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/profiles/{profileId}:
+    parameters:
+      - $ref: '#/components/parameters/ProfileId'
+    patch:
+      tags: [profiles]
+      operationId: updateProfile
+      summary: Update a profile (JSON Merge Patch)
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: {$ref: '#/components/schemas/ProfileUpdate'}
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Profile'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [profiles]
+      operationId: deleteProfile
+      summary: Delete a profile (devices become unassigned)
+      x-required-role: owner
+      responses:
+        '204': {description: "Deleted"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/alerts:
+    get:
+      tags: [alerts]
+      operationId: listAlerts
+      summary: List alerts (newest first)
+      x-required-role: viewer
+      parameters:
+        - name: unread
+          in: query
+          schema: {type: boolean}
+        - name: kind
+          in: query
+          schema: {$ref: '#/components/schemas/AlertKind'}
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Alerts
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AlertPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/alerts/{alertRef}:
+    parameters:
+      - $ref: '#/components/parameters/AlertRef'
+    get:
+      tags: [alerts]
+      operationId: getAlert
+      summary: Get an alert by its opaque reference (as received in a push)
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Alert
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Alert'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/alerts/{alertRef}/read:
+    parameters:
+      - $ref: '#/components/parameters/AlertRef'
+    post:
+      tags: [alerts]
+      operationId: markAlertRead
+      summary: Mark an alert as read
+      x-required-role: viewer
+      responses:
+        '204': {description: "Marked"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/alerts/read-all:
+    post:
+      tags: [alerts]
+      operationId: markAllAlertsRead
+      summary: Mark all alerts as read
+      x-required-role: viewer
+      responses:
+        '204': {description: "Marked"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/alert-rules:
+    get:
+      tags: [alerts]
+      operationId: listAlertRules
+      summary: List alert rules
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Rules
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/AlertRule'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [alerts]
+      operationId: createAlertRule
+      summary: Create an alert rule
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AlertRuleWrite'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AlertRule'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/alert-rules/{ruleId}:
+    parameters:
+      - name: ruleId
+        in: path
+        required: true
+        schema: {type: string, format: uuid, maxLength: 36}
+    put:
+      tags: [alerts]
+      operationId: replaceAlertRule
+      summary: Replace an alert rule
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AlertRuleWrite'}
+      responses:
+        '200':
+          description: Replaced
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AlertRule'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [alerts]
+      operationId: deleteAlertRule
+      summary: Delete an alert rule
+      x-required-role: owner
+      responses:
+        '204': {description: "Deleted"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/consents:
+    get:
+      tags: [privacy]
+      operationId: listConsents
+      summary: Consent records stored on the agent
+      x-required-role: owner
+      responses:
+        '200':
+          description: Consent records
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/ConsentRecord'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [privacy]
+      operationId: recordConsent
+      summary: Record a consent decision or acknowledgement
+      description: Members can record consents for themselves. `minor_parental_consent` and `monitoring_disclosure_ack` require the owner role.
+      x-required-role: member
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ConsentCreate'}
+      responses:
+        '201':
+          description: Recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ConsentRecord'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/consents/{consentId}/withdraw:
+    parameters:
+      - name: consentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid, maxLength: 36}
+    post:
+      tags: [privacy]
+      operationId: withdrawConsent
+      summary: Withdraw a consent
+      description: |
+        Withdrawing `network_monitoring` stops DNS logging and session tracking immediately. The resolver keeps
+        working so household internet is not disrupted. Withdrawing `minor_parental_consent` erases that profile's data.
+      x-required-role: member
+      responses:
+        '200':
+          description: Withdrawn
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ConsentRecord'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/export:
+    get:
+      tags: [privacy]
+      operationId: exportData
+      summary: Export household data (streamed)
+      description: |
+        `json` returns a single JSON document. `csv` returns a ZIP archive containing one CSV per entity
+        (devices.csv, sessions.csv, queries.csv, sites.csv, alerts.csv, consents.csv). MACs are included unmasked. This operation is audited.
+      x-required-role: owner
+      parameters:
+        - name: format
+          in: query
+          required: true
+          schema: {type: string, enum: [json, csv]}
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Export stream
+          headers:
+            Content-Disposition:
+              schema: {type: string, maxLength: 255}
+              description: attachment; filename="hnt-export-<date>.(json|zip)"
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ExportDocument'}
+            application/zip:
+              schema:
+                type: string
+                contentMediaType: application/zip
+                maxLength: 255
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/data/erase:
+    post:
+      tags: [privacy]
+      operationId: eraseData
+      summary: Delete household data
+      description: |
+        - `activity`: deletes all DNS queries, aggregates, sessions and alerts. Devices, profiles and pairing are kept.
+        - `everything`: factory reset. Deletes the database file and keys (crypto-shredding), revokes all clients,
+          disables remote mode and returns the agent to unpaired state. The response is sent before the reset begins.
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, confirm]
+              properties:
+                scope: {type: string, enum: [activity, everything]}
+                confirm:
+                  type: string
+                  const: DELETE
+                  description: Must be the literal string DELETE
+      responses:
+        '202': {description: "Erasure started (completes within 60 s)"}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/audit:
+    get:
+      tags: [privacy]
+      operationId: listAuditLog
+      summary: Agent audit log (newest first)
+      x-required-role: owner
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Audit entries
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuditPage'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/audit/verify:
+    get:
+      tags: [privacy]
+      operationId: verifyAuditLog
+      summary: Verify the audit log hash chain
+      x-required-role: owner
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [valid, entries_checked]
+                properties:
+                  valid: {type: boolean}
+                  entries_checked: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+                  first_invalid_id: {type: [integer, 'null'], format: int64, minimum: 0, maximum: 9223372036854775807}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/sync/changes:
+    get:
+      tags: [sync]
+      operationId: getChanges
+      summary: Delta changes since a revision (offline-first sync)
+      description: |
+        Returns entities changed after `since`, ordered by revision. Call repeatedly while `has_more` is true.
+        If `since` is older than the tombstone horizon (30 days), the agent responds with 410 and the client must do a full resync (`since=0`).
+      x-required-role: viewer
+      parameters:
+        - name: since
+          in: query
+          required: true
+          schema: {type: integer, minimum: 0, format: int64, maximum: 9223372036854775807}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 500, format: int32}
+      responses:
+        '200':
+          description: Changes
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SyncChanges'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '410':
+          description: Revision too old. Full resync required.
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    mtls:
+      type: mutualTLS
+      description: Client certificate issued by the household CA at pairing. TLS 1.3 only. Agent SPKI pinned by the client.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: {type: string, format: uuid, maxLength: 36}
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous `next_cursor`
+      schema: {type: string, maxLength: 256}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50, format: int32}
+    From:
+      name: from
+      in: query
+      description: Inclusive lower bound (defaults to 24 h ago for logs, or the retention start for timelines)
+      schema: {type: string, format: date-time, maxLength: 35}
+    To:
+      name: to
+      in: query
+      description: Exclusive upper bound (defaults to now)
+      schema: {type: string, format: date-time, maxLength: 35}
+    Reveal:
+      name: reveal
+      in: query
+      description: Return unmasked MAC addresses (owner only, audited)
+      schema: {type: boolean, default: false}
+    DeviceId:
+      name: deviceId
+      in: path
+      required: true
+      schema: {type: string, format: uuid, maxLength: 36}
+    ProfileId:
+      name: profileId
+      in: path
+      required: true
+      schema: {type: string, format: uuid, maxLength: 36}
+    MemberId:
+      name: memberId
+      in: path
+      required: true
+      schema: {type: string, format: uuid, maxLength: 36}
+    ClientId:
+      name: clientId
+      in: path
+      required: true
+      schema: {type: string, format: uuid, maxLength: 36}
+    AlertRef:
+      name: alertRef
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/AlertRef'}
+    Etld1:
+      name: etld1
+      in: path
+      required: true
+      schema: {type: string, maxLength: 253, pattern: '^[A-Za-z0-9.-]+$'}
+
+  responses:
+    BadRequest:
+      description: Validation failed
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthorized:
+      description: Missing, invalid or revoked client certificate
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Forbidden:
+      description: Role is insufficient for this operation
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Conflict:
+      description: Request conflicts with current state
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    TooManyRequests:
+      description: Rate limited
+      headers:
+        Retry-After:
+          schema: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+          description: Seconds to wait
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    InternalError:
+      description: Unexpected server error (no internal details are returned)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type: {type: string, format: uri-reference, examples: ['https://hnt.dev/problems/validation'], maxLength: 2048}
+        title: {type: string, maxLength: 255}
+        status: {type: integer, minimum: 400, maximum: 599, format: int32}
+        detail: {type: string, maxLength: 2000}
+        instance: {type: string, maxLength: 255}
+        code:
+          type: string
+          description: Stable machine-readable error code used for localised messages in the app
+          maxLength: 255
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, code]
+            properties:
+              field: {type: string, maxLength: 255}
+              code: {type: string, maxLength: 255}
+          maxItems: 100
+
+    Role:
+      type: string
+      enum: [owner, member, viewer]
+
+    AlertRef:
+      type: string
+      description: Opaque 128-bit reference, base32 (26 chars, lower-case, no padding)
+      pattern: '^[a-z2-7]{26}$'
+
+      maxLength: 255
+    PairRequest:
+      type: object
+      required: [token_id, csr, noise_pub, proof, device_label, platform]
+      properties:
+        token_id: {type: string, maxLength: 64}
+        csr:
+          type: string
+          contentEncoding: base64
+          description: DER-encoded PKCS#10 CSR, ECDSA P-256
+          maxLength: 8192
+        noise_pub:
+          type: string
+          contentEncoding: base64
+          description: App X25519 static public key (32 bytes)
+          maxLength: 64
+        proof:
+          type: string
+          description: base64url HMAC-SHA256 (see operation description)
+          maxLength: 64
+        device_label: {type: string, minLength: 1, maxLength: 64}
+        platform: {type: string, enum: [android, ios]}
+        member_name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Display name for the new member (ignored when joining as an existing member)
+
+    PairResponse:
+      type: object
+      required: [household_id, agent_id, member_id, client_id, role, certificate, agent_noise_pub]
+      properties:
+        household_id: {type: string, format: uuid, maxLength: 36}
+        agent_id: {type: string, format: uuid, maxLength: 36}
+        member_id: {type: string, format: uuid, maxLength: 36}
+        client_id: {type: string, format: uuid, maxLength: 36}
+        role: {$ref: '#/components/schemas/Role'}
+        certificate: {$ref: '#/components/schemas/CertificateBundle'}
+        agent_noise_pub: {type: string, contentEncoding: base64, maxLength: 64}
+        monitoring_ack_required:
+          type: boolean
+          description: True when the owner has not yet acknowledged the monitoring-disclosure duty
+
+    CertificateBundle:
+      type: object
+      required: [client_cert, ca_cert, not_after]
+      properties:
+        client_cert: {type: string, description: "PEM", maxLength: 16384}
+        ca_cert: {type: string, description: "PEM household CA", maxLength: 16384}
+        not_after: {type: string, format: date-time, maxLength: 35}
+
+    PairingQrPayload:
+      type: object
+      description: |
+        Content of the pairing QR. It is encoded on the wire as CBOR then base45, with the prefix `HNT1:`.
+        The JSON form is returned to the owner's app, which renders it.
+      required: [v, agent_id, lan_addrs, port, spki_sha256, noise_pub, token_id, token_secret, exp, role]
+      properties:
+        v: {type: integer, const: 1, format: int32, minimum: 0, maximum: 2147483647}
+        agent_id: {type: string, format: uuid, maxLength: 36}
+        lan_addrs:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items: {type: string, description: "IPv4 or IPv6 literal", maxLength: 255}
+        port: {type: integer, minimum: 1, maximum: 65535, format: int32}
+        spki_sha256: {type: string, contentEncoding: base64, maxLength: 64}
+        noise_pub: {type: string, contentEncoding: base64, maxLength: 64}
+        token_id: {type: string, maxLength: 255}
+        token_secret: {type: string, contentEncoding: base64, description: "128-bit secret", maxLength: 64}
+        exp: {type: string, format: date-time, maxLength: 35}
+        role: {$ref: '#/components/schemas/Role'}
+        qr_text: {type: string, description: "Ready-to-render `HNT1:` string", maxLength: 1024}
+
+    InviteRequest:
+      type: object
+      required: [role]
+      properties:
+        role: {type: string, enum: [member, viewer]}
+
+    Me:
+      type: object
+      required: [member_id, client_id, role, display_name, household_id, transport]
+      properties:
+        member_id: {type: string, format: uuid, maxLength: 36}
+        client_id: {type: string, format: uuid, maxLength: 36}
+        household_id: {type: string, format: uuid, maxLength: 36}
+        role: {$ref: '#/components/schemas/Role'}
+        display_name: {type: string, maxLength: 255}
+        cert_not_after: {type: string, format: date-time, maxLength: 35}
+        cert_renewal_due: {type: boolean}
+        transport: {type: string, enum: [lan, relay]}
+
+    Member:
+      type: object
+      required: [id, display_name, role, created_at, clients]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        display_name: {type: string, maxLength: 255}
+        role: {$ref: '#/components/schemas/Role'}
+        created_at: {type: string, format: date-time, maxLength: 35}
+        cloud_linked: {type: boolean}
+        clients:
+          type: array
+          items: {$ref: '#/components/schemas/PairedClient'}
+          maxItems: 100
+
+    MemberUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        display_name: {type: string, minLength: 1, maxLength: 64}
+        role: {type: string, enum: [member, viewer]}
+
+    PairedClient:
+      type: object
+      required: [id, platform, device_label, paired_at, cert_not_after]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        platform: {type: string, enum: [android, ios]}
+        device_label: {type: string, maxLength: 255}
+        paired_at: {type: string, format: date-time, maxLength: 35}
+        last_seen_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+        cert_not_after: {type: string, format: date-time, maxLength: 35}
+        is_current: {type: boolean, description: "True for the calling client"}
+
+    AgentInfo:
+      type: object
+      required: [agent_id, household_id, version, install_type, arch, capture_mode, started_at, health]
+      properties:
+        agent_id: {type: string, format: uuid, maxLength: 36}
+        household_id: {type: string, format: uuid, maxLength: 36}
+        version: {type: string, examples: ['1.0.0'], maxLength: 255}
+        install_type: {type: string, enum: [docker, openwrt, binary]}
+        arch: {type: string, examples: [arm64], maxLength: 255}
+        capture_mode: {$ref: '#/components/schemas/CaptureMode'}
+        started_at: {type: string, format: date-time, maxLength: 35}
+        lan_addrs:
+          type: array
+          items: {type: string, maxLength: 255}
+          maxItems: 100
+        health: {$ref: '#/components/schemas/AgentHealth'}
+
+    AgentHealth:
+      type: object
+      required: [status, dns, upstream, time_sync, storage]
+      properties:
+        status: {type: string, enum: [ok, degraded, failing]}
+        dns:
+          type: object
+          required: [serving, qps_1m, p95_overhead_ms]
+          properties:
+            serving: {type: boolean}
+            qps_1m: {type: number}
+            p95_overhead_ms: {type: number}
+            dropped_log_events_24h: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+        upstream:
+          type: object
+          required: [reachable]
+          properties:
+            reachable: {type: boolean}
+            p95_rtt_ms: {type: [number, 'null']}
+        time_sync:
+          type: object
+          required: [synced]
+          properties:
+            synced: {type: boolean}
+            offset_ms: {type: [number, 'null']}
+        storage:
+          type: object
+          required: [db_mb, max_db_mb]
+          properties:
+            db_mb: {type: number}
+            max_db_mb: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+            oldest_query_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+        devices_without_dns:
+          type: integer
+          description: Online devices that have sent no queries to the agent in 30 min (possible bypass or misconfiguration)
+
+          format: int32
+          minimum: 0
+          maximum: 2147483647
+    CaptureMode:
+      type: string
+      enum: [router_dns, agent_dhcp, openwrt]
+
+    UpstreamPreset:
+      type: object
+      required: [id, name, protocols, doh_url, dot_host]
+      properties:
+        id: {type: string, enum: [cloudflare, google, quad9, adguard]}
+        name: {type: string, maxLength: 255}
+        protocols:
+          type: array
+          items: {type: string, enum: [doh, dot]}
+          maxItems: 100
+        doh_url: {type: string, format: uri, maxLength: 2048}
+        dot_host: {type: string, maxLength: 255}
+        privacy_policy_url: {type: string, format: uri, maxLength: 2048}
+        filters_malware: {type: boolean}
+        india_pop: {type: boolean, description: "Operator has points of presence in India (queries may still leave India)"}
+
+    UpstreamConfig:
+      type: object
+      required: [preset, protocol]
+      properties:
+        preset: {type: string, enum: [cloudflare, google, quad9, adguard, custom]}
+        protocol: {type: string, enum: [doh, dot]}
+        custom_url:
+          type: [string, 'null']
+          description: Required when preset=custom. Must be https:// (DoH) or tls:// host (DoT)
+          maxLength: 255
+        bootstrap_ips:
+          type: array
+          maxItems: 4
+          items: {type: string, maxLength: 255}
+
+    DhcpServerConfig:
+      type: object
+      required: [enabled]
+      properties:
+        enabled: {type: boolean}
+        range_start: {type: string, format: ipv4, maxLength: 15}
+        range_end: {type: string, format: ipv4, maxLength: 15}
+        subnet_mask: {type: string, format: ipv4, maxLength: 15}
+        gateway: {type: string, format: ipv4, maxLength: 15}
+        lease_hours: {type: integer, minimum: 1, maximum: 168, default: 24, format: int32}
+        static_leases:
+          type: array
+          maxItems: 256
+          items:
+            type: object
+            required: [mac, ipv4]
+            properties:
+              mac: {type: string, pattern: '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$', maxLength: 255}
+              ipv4: {type: string, format: ipv4, maxLength: 15}
+              hostname: {type: string, maxLength: 63}
+
+    Settings:
+      type: object
+      required: [retention_days, max_db_mb, timezone, upstream, doh_block, capture_mode, dhcp_server, alerts_enabled, remote_enabled, monitoring_active]
+      properties:
+        retention_days: {type: integer, enum: [7, 30, 90], format: int32, minimum: 0, maximum: 2147483647}
+        max_db_mb: {type: integer, minimum: 64, format: int32, maximum: 2147483647}
+        timezone: {type: string, examples: [Asia/Kolkata], maxLength: 255}
+        upstream: {$ref: '#/components/schemas/UpstreamConfig'}
+        doh_block:
+          type: object
+          required: [enabled, block_icloud_relay]
+          properties:
+            enabled: {type: boolean}
+            block_icloud_relay: {type: boolean}
+        capture_mode: {$ref: '#/components/schemas/CaptureMode'}
+        dhcp_server: {$ref: '#/components/schemas/DhcpServerConfig'}
+        alerts_enabled: {type: boolean}
+        remote_enabled: {type: boolean, readOnly: true, description: "Change via /v1/remote/*"}
+        monitoring_active:
+          type: boolean
+          readOnly: true
+          description: False when the network_monitoring consent has been withdrawn (resolver still serves DNS)
+        notice_page_enabled:
+          type: boolean
+          description: Serve the household network notice page at http://notice.home.arpa
+
+    SettingsUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        retention_days: {type: integer, enum: [7, 30, 90], format: int32, minimum: 0, maximum: 2147483647}
+        max_db_mb: {type: integer, minimum: 64, format: int32, maximum: 2147483647}
+        timezone: {type: string, maxLength: 255}
+        upstream: {$ref: '#/components/schemas/UpstreamConfig'}
+        doh_block:
+          type: object
+          properties:
+            enabled: {type: boolean}
+            block_icloud_relay: {type: boolean}
+        capture_mode: {$ref: '#/components/schemas/CaptureMode'}
+        dhcp_server: {$ref: '#/components/schemas/DhcpServerConfig'}
+        alerts_enabled: {type: boolean}
+        notice_page_enabled: {type: boolean}
+
+    RemoteStatus:
+      type: object
+      required: [enabled, state]
+      properties:
+        enabled: {type: boolean}
+        state: {type: string, enum: [disabled, connecting, connected, error]}
+        relay_url: {type: [string, 'null'], format: uri, maxLength: 2048}
+        connected_since: {type: [string, 'null'], format: date-time, maxLength: 35}
+        last_error_code: {type: [string, 'null'], maxLength: 255}
+
+    RemoteEnableRequest:
+      type: object
+      required: [enrollment_code, relay_url]
+      properties:
+        enrollment_code: {type: string, minLength: 16, maxLength: 64}
+        relay_url:
+          type: string
+          format: uri
+          pattern: '^wss://'
+          description: Must match an allow-listed relay host compiled into the agent for the flavor
+
+          maxLength: 2048
+    UpdateStatus:
+      type: object
+      required: [current_version, install_type, auto_update]
+      properties:
+        current_version: {type: string, maxLength: 255}
+        available_version: {type: [string, 'null'], maxLength: 255}
+        manifest_verified_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+        install_type: {type: string, enum: [docker, openwrt, binary]}
+        auto_update: {type: boolean}
+        docker_update_command:
+          type: [string, 'null']
+          description: Digest-pinned command for Docker installs (notify-only mode)
+
+          maxLength: 512
+    Dashboard:
+      type: object
+      required: [generated_at, online_now, devices_total, top_sites_today, new_devices_this_week, unread_alerts]
+      properties:
+        generated_at: {type: string, format: date-time, maxLength: 35}
+        online_now:
+          type: array
+          maxItems: 50
+          items: {$ref: '#/components/schemas/DeviceSummary'}
+        devices_total: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        top_sites_today:
+          type: array
+          maxItems: 10
+          items: {$ref: '#/components/schemas/SiteSummary'}
+        new_devices_this_week:
+          type: array
+          maxItems: 50
+          items: {$ref: '#/components/schemas/DeviceSummary'}
+        unread_alerts: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        bypass_suspected_devices: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+
+    DeviceType:
+      type: string
+      enum: [phone, tablet, computer, tv, streaming, speaker, console, camera, printer, iot, router, wearable, unknown]
+
+    DeviceSummary:
+      type: object
+      required: [id, name, device_type, online]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        name: {type: string, maxLength: 255}
+        device_type: {$ref: '#/components/schemas/DeviceType'}
+        online: {type: boolean}
+        profile_id: {type: [string, 'null'], format: uuid, maxLength: 36}
+        first_seen_at: {type: string, format: date-time, maxLength: 35}
+
+    Device:
+      type: object
+      required: [id, name, auto_name, device_type, type_source, trusted, online, first_seen_at, last_seen_at, mac_display, possibly_randomized, rev]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        name: {type: string, description: "display_name if set, otherwise auto_name", maxLength: 255}
+        display_name: {type: [string, 'null'], maxLength: 255}
+        auto_name: {type: string, maxLength: 255}
+        vendor: {type: [string, 'null'], maxLength: 255}
+        device_type: {$ref: '#/components/schemas/DeviceType'}
+        type_source: {type: string, enum: [heuristic, user]}
+        profile_id: {type: [string, 'null'], format: uuid, maxLength: 36}
+        trusted: {type: boolean}
+        online: {type: boolean}
+        ipv4: {type: [string, 'null'], maxLength: 255}
+        mac_display:
+          type: string
+          description: Masked unless reveal=true by an owner, e.g. "••:••:••:3A:4F:C2"
+          maxLength: 255
+        possibly_randomized: {type: boolean}
+        bypass_suspected_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+        first_seen_at: {type: string, format: date-time, maxLength: 35}
+        last_seen_at: {type: string, format: date-time, maxLength: 35}
+        current_session_started_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+        rev: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+
+    DeviceUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        display_name: {type: [string, 'null'], minLength: 1, maxLength: 64}
+        device_type: {$ref: '#/components/schemas/DeviceType'}
+        profile_id: {type: [string, 'null'], format: uuid, maxLength: 36}
+        trusted: {type: boolean}
+
+    DevicePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Device'}
+          maxItems: 200
+        next_cursor: {type: [string, 'null'], maxLength: 256}
+
+    DeviceIdentifier:
+      type: object
+      required: [kind, value, first_seen_at, last_seen_at]
+      properties:
+        kind: {type: string, enum: [mac, dhcp_client_id, hostname, dhcp_fp, mdns_name, ipv6_iid]}
+        value: {type: string, description: "MAC values are masked unless reveal=true", maxLength: 255}
+        locally_administered: {type: boolean, description: "For MACs, the randomised/private bit is set"}
+        first_seen_at: {type: string, format: date-time, maxLength: 35}
+        last_seen_at: {type: string, format: date-time, maxLength: 35}
+
+    MergeRequest:
+      type: object
+      required: [source_ids]
+      properties:
+        source_ids:
+          type: array
+          minItems: 1
+          maxItems: 10
+          uniqueItems: true
+          items: {type: string, format: uuid, maxLength: 36}
+
+    MergeResult:
+      type: object
+      required: [merge_id, device, undo_expires_at]
+      properties:
+        merge_id: {type: string, format: uuid, maxLength: 36}
+        device: {$ref: '#/components/schemas/Device'}
+        undo_expires_at: {type: string, format: date-time, maxLength: 35}
+
+    Session:
+      type: object
+      required: [id, device_id, connected_at, rev]
+      properties:
+        id: {type: string, description: "Opaque session id", maxLength: 255}
+        device_id: {type: string, format: uuid, maxLength: 36}
+        connected_at: {type: string, format: date-time, maxLength: 35}
+        disconnected_at: {type: [string, 'null'], format: date-time, description: "null = still online", maxLength: 35}
+        duration_seconds: {type: [integer, 'null'], format: int32, minimum: 0, maximum: 2147483647}
+        ipv4: {type: [string, 'null'], maxLength: 255}
+        rev: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+
+    SessionPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Session'}
+          maxItems: 200
+        next_cursor: {type: [string, 'null'], maxLength: 256}
+
+    CategoryCode:
+      type: string
+      enum: [social, video, gaming, adult, shopping, education, news, malicious, infrastructure, unknown]
+
+    Category:
+      type: object
+      required: [code, sensitive, alertable, hidden_by_default]
+      properties:
+        code: {$ref: '#/components/schemas/CategoryCode'}
+        sensitive: {type: boolean}
+        alertable: {type: boolean}
+        hidden_by_default: {type: boolean}
+
+    Site:
+      type: object
+      required: [etld1, category, category_source]
+      properties:
+        etld1: {type: string, examples: [youtube.com], maxLength: 253}
+        brand: {type: [string, 'null'], examples: [YouTube], maxLength: 255}
+        category: {$ref: '#/components/schemas/CategoryCode'}
+        category_source: {type: string, enum: [bundle, user]}
+
+    SiteSummary:
+      allOf:
+        - $ref: '#/components/schemas/Site'
+        - type: object
+          required: [query_count, device_count, first_seen_at, last_seen_at]
+          properties:
+            query_count: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+            device_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+            first_seen_at: {type: string, format: date-time, maxLength: 35}
+            last_seen_at: {type: string, format: date-time, maxLength: 35}
+
+    SitePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/SiteSummary'}
+          maxItems: 200
+        next_cursor: {type: [string, 'null'], maxLength: 256}
+
+    QueryRecord:
+      type: object
+      required: [id, ts, device_id, qname, etld1, qtype, rcode, repeat_count, cached, category]
+      properties:
+        id: {type: string, maxLength: 255}
+        ts: {type: string, format: date-time, maxLength: 35}
+        last_ts: {type: string, format: date-time, maxLength: 35}
+        device_id: {type: string, format: uuid, maxLength: 36}
+        qname: {type: string, maxLength: 253}
+        etld1: {type: string, maxLength: 253}
+        category: {$ref: '#/components/schemas/CategoryCode'}
+        qtype: {type: string, examples: [A, AAAA, HTTPS], maxLength: 255}
+        rcode: {type: string, examples: [NOERROR, NXDOMAIN], maxLength: 255}
+        repeat_count: {type: integer, minimum: 1, format: int32, maximum: 2147483647}
+        cached: {type: boolean}
+        doh_canary: {type: boolean}
+        upstream_ms: {type: [integer, 'null'], format: int32, minimum: 0, maximum: 2147483647}
+        answer: {type: [string, 'null'], maxLength: 512}
+
+    QueryPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/QueryRecord'}
+          maxItems: 200
+        next_cursor: {type: [string, 'null'], maxLength: 256}
+
+    Schedule:
+      type: object
+      description: Allowed online hours per weekday in household local time. Used by outside_hours alerts (and future blocking).
+      required: [windows]
+      properties:
+        windows:
+          type: array
+          maxItems: 28
+          items:
+            type: object
+            required: [days, start, end]
+            properties:
+              days:
+                type: array
+                minItems: 1
+                uniqueItems: true
+                items: {type: string, enum: [mon, tue, wed, thu, fri, sat, sun]}
+                maxItems: 100
+              start: {type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$', maxLength: 255}
+              end: {type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$', description: "May be earlier than start (crosses midnight)", maxLength: 255}
+
+    Profile:
+      type: object
+      required: [id, name, avatar, is_minor, device_count, rev]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        name: {type: string, maxLength: 255}
+        avatar: {type: string, maxLength: 255}
+        is_minor: {type: boolean}
+        schedule: {oneOf: [$ref: '#/components/schemas/Schedule', type: 'null']}
+        device_count: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        rev: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+
+    ProfileCreate:
+      type: object
+      required: [name, is_minor]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 40}
+        avatar: {type: string, maxLength: 32}
+        is_minor: {type: boolean}
+        parental_consent_id:
+          type: string
+          format: uuid
+          description: Required when is_minor=true. Id of a granted minor_parental_consent record created for this profile.
+          maxLength: 36
+        schedule: {oneOf: [$ref: '#/components/schemas/Schedule', type: 'null']}
+
+    ProfileUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name: {type: string, minLength: 1, maxLength: 40}
+        avatar: {type: string, maxLength: 32}
+        schedule: {oneOf: [$ref: '#/components/schemas/Schedule', type: 'null']}
+
+    AlertKind:
+      type: string
+      enum: [new_device, outside_hours, category_access, dns_bypass, agent_update]
+
+    Alert:
+      type: object
+      required: [ref, kind, severity, created_at, read, rev]
+      properties:
+        ref: {$ref: '#/components/schemas/AlertRef'}
+        kind: {$ref: '#/components/schemas/AlertKind'}
+        severity: {type: string, enum: [info, warning, critical]}
+        created_at: {type: string, format: date-time, maxLength: 35}
+        read: {type: boolean}
+        device: {oneOf: [$ref: '#/components/schemas/DeviceSummary', type: 'null']}
+        site: {oneOf: [$ref: '#/components/schemas/Site', type: 'null']}
+        details:
+          type: object
+          description: Kind-specific fields (e.g. schedule window for outside_hours, version for agent_update)
+          additionalProperties: true
+        rev: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+
+    AlertPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Alert'}
+          maxItems: 200
+        next_cursor: {type: [string, 'null'], maxLength: 256}
+
+    AlertRule:
+      type: object
+      required: [id, kind, enabled, params]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        kind: {type: string, enum: [new_device, outside_hours, category_access, dns_bypass]}
+        enabled: {type: boolean}
+        profile_id: {type: [string, 'null'], format: uuid, maxLength: 36}
+        params: {$ref: '#/components/schemas/AlertRuleParams'}
+
+    AlertRuleWrite:
+      type: object
+      required: [kind, enabled]
+      properties:
+        kind: {type: string, enum: [new_device, outside_hours, category_access, dns_bypass]}
+        enabled: {type: boolean}
+        profile_id: {type: [string, 'null'], format: uuid, maxLength: 36}
+        params: {$ref: '#/components/schemas/AlertRuleParams'}
+
+    AlertRuleParams:
+      type: object
+      properties:
+        categories:
+          type: array
+          description: For category_access only
+          uniqueItems: true
+          items: {type: string, enum: [adult, malicious]}
+          maxItems: 100
+      additionalProperties: false
+
+    ConsentPurpose:
+      type: string
+      enum: [network_monitoring, monitoring_disclosure_ack, minor_parental_consent, remote_access, push_notifications, crash_reports, analytics]
+
+    ConsentCreate:
+      type: object
+      required: [purpose, notice_version, language, granted, evidence_sha256]
+      properties:
+        purpose: {$ref: '#/components/schemas/ConsentPurpose'}
+        notice_version: {type: string, maxLength: 32, examples: ['2026-11-v1']}
+        language: {type: string, enum: [en, hi, te, ta]}
+        granted: {type: boolean}
+        evidence_sha256:
+          type: string
+          contentEncoding: base64
+          description: SHA-256 of the exact notice text displayed
+          maxLength: 64
+        profile_id:
+          type: [string, 'null']
+          format: uuid
+          description: Required for minor_parental_consent. May reference a profile being created (see createProfile).
+          maxLength: 36
+        attestations:
+          type: array
+          description: Statements the user explicitly confirmed (e.g. "i_am_parent_or_guardian", "will_inform_household")
+          items: {type: string, maxLength: 64}
+          maxItems: 100
+
+    ConsentRecord:
+      type: object
+      required: [id, purpose, notice_version, language, granted, method, created_at]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        purpose: {$ref: '#/components/schemas/ConsentPurpose'}
+        notice_version: {type: string, maxLength: 255}
+        language: {type: string, maxLength: 255}
+        granted: {type: boolean}
+        method: {type: string, enum: [in_app_ack, parental_attestation]}
+        member_id: {type: [string, 'null'], format: uuid, maxLength: 36}
+        profile_id: {type: [string, 'null'], format: uuid, maxLength: 36}
+        created_at: {type: string, format: date-time, maxLength: 35}
+        withdrawn_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+
+    AuditEntry:
+      type: object
+      required: [id, ts, actor, action]
+      properties:
+        id: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+        ts: {type: string, format: date-time, maxLength: 35}
+        actor: {type: string, maxLength: 255}
+        action: {type: string, examples: [pairing.completed, settings.retention_changed, device.mac_revealed], maxLength: 255}
+        target_type: {type: [string, 'null'], maxLength: 255}
+        target_id: {type: [string, 'null'], maxLength: 255}
+        details: {type: object, additionalProperties: true}
+
+    AuditPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/AuditEntry'}
+          maxItems: 200
+        next_cursor: {type: [string, 'null'], maxLength: 256}
+
+    Tombstone:
+      type: object
+      required: [entity, id, rev]
+      properties:
+        entity: {type: string, enum: [device, session, alert, profile, member, client, alert_rule]}
+        id: {type: string, maxLength: 255}
+        rev: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+
+    SyncChanges:
+      type: object
+      required: [from_rev, to_rev, has_more, devices, sessions, alerts, profiles, deleted]
+      properties:
+        from_rev: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+        to_rev: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775807}
+        has_more: {type: boolean}
+        devices:
+          type: array
+          items: {$ref: '#/components/schemas/Device'}
+          maxItems: 1000
+        sessions:
+          type: array
+          items: {$ref: '#/components/schemas/Session'}
+          maxItems: 1000
+        alerts:
+          type: array
+          items: {$ref: '#/components/schemas/Alert'}
+          maxItems: 1000
+        profiles:
+          type: array
+          items: {$ref: '#/components/schemas/Profile'}
+          maxItems: 1000
+        settings: {oneOf: [$ref: '#/components/schemas/Settings', type: 'null']}
+        deleted:
+          type: array
+          items: {$ref: '#/components/schemas/Tombstone'}
+          maxItems: 1000
+
+    ExportDocument:
+      type: object
+      required: [format_version, exported_at, household_id, range, devices, sessions, queries, profiles, alerts, consents]
+      properties:
+        format_version: {type: integer, const: 1, format: int32, minimum: 0, maximum: 2147483647}
+        exported_at: {type: string, format: date-time, maxLength: 35}
+        household_id: {type: string, format: uuid, maxLength: 36}
+        range:
+          type: object
+          required: [from, to]
+          properties:
+            from: {type: string, format: date-time, maxLength: 35}
+            to: {type: string, format: date-time, maxLength: 35}
+        devices:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/Device'
+              - type: object
+                properties:
+                  identifiers:
+                    type: array
+                    items: {$ref: '#/components/schemas/DeviceIdentifier'}
+                    maxItems: 100
+          maxItems: 10000000
+        sessions:
+          type: array
+          items: {$ref: '#/components/schemas/Session'}
+          maxItems: 10000000
+        queries:
+          type: array
+          items: {$ref: '#/components/schemas/QueryRecord'}
+          maxItems: 10000000
+        profiles:
+          type: array
+          items: {$ref: '#/components/schemas/Profile'}
+          maxItems: 10000000
+        alerts:
+          type: array
+          items: {$ref: '#/components/schemas/Alert'}
+          maxItems: 10000000
+        consents:
+          type: array
+          items: {$ref: '#/components/schemas/ConsentRecord'}
+          maxItems: 10000000

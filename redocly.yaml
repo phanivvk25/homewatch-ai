@@ -1,0 +1,14 @@
+# Redocly CLI config (structural validation + bundling for docs). Spectral (api/.spectral.yaml) is the policy linter.
+extends:
+  - recommended
+apis:
+  agent@v1:
+    root: api/agent.openapi.yaml
+  cloud@v1:
+    root: api/cloud.openapi.yaml
+    decorators: {}
+    rules:
+      # RelayFrame documents binary WebSocket framing (see api/.spectral.yaml for rationale).
+      no-unused-components: off
+      # /v1/relay/* succeed with 101 Switching Protocols.
+      operation-2xx-response: off

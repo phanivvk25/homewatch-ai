@@ -1,5 +1,5 @@
 # ADR-0013: Content-free push; alerts generated on the agent
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Decision
 - The agent evaluates alert rules (new unknown device, online outside allowed hours, category hit: adult or malicious) because only it sees the data.

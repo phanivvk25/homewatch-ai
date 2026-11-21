@@ -1,5 +1,5 @@
 # ADR-0005: Device identity and MAC randomisation
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 Android 10+ and iOS 14+ use per-SSID random MACs, and some rotate them periodically (iOS 18 "rotating", Android "non-persistent"). Keying devices purely by MAC creates duplicates.

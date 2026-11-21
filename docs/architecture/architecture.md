@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| Status | **Proposed (awaiting approval)** |
+| Status | **Accepted** (2026-11-21) |
 | Version | 0.1.0 |
 | Date | 2026-11-21 |
 | Scope | MVP (see product brief) |
-| Related | [Threat model](../security/threat-model.md), [ADRs](../adr/README.md) |
+| Related | [Threat model](../security/threat-model.md), [ADRs](../adr/README.md), [Data model](data-model.md), [API contracts](../../api/README.md) |
 
 ---
 

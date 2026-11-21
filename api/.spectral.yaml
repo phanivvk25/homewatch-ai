@@ -1,0 +1,62 @@
+# Spectral ruleset for the API contracts.
+# Run (from repo root): tools/openapi/node_modules/.bin/spectral lint -r api/.spectral.yaml api/*.openapi.yaml
+# CI fails on any error or warning (--fail-severity=warn).
+extends:
+  - spectral:oas
+  - ../tools/openapi/node_modules/@stoplight/spectral-owasp-ruleset/dist/ruleset.mjs
+
+rules:
+  operation-tags: error
+  operation-operationId: error
+  oas3-api-servers: error
+
+  # Every operation must have a summary. Long-form descriptions are written where behaviour needs explaining
+  # (security, side effects, limits), not duplicated from the summary.
+  operation-description: off
+  hnt-operation-summary:
+    description: Operations must have a non-empty summary
+    severity: error
+    given: "$.paths[*][get,put,post,delete,patch]"
+    then:
+      field: summary
+      function: truthy
+
+  # Free-text fields (display names, descriptions, device labels) cannot be meaningfully restricted with a
+  # pattern or format. Every string has a maxLength (owasp:api4:2023-string-limit stays enabled), and server-side
+  # validation normalises Unicode (NFC) and rejects control characters.
+  owasp:api4:2023-string-restricted: off
+
+  # Both APIs are consumed only by native apps and agents, never by browsers. The servers send no CORS headers,
+  # so every browser cross-origin request is denied by default. Declaring Access-Control-Allow-Origin would imply
+  # browser access we do not offer.
+  owasp:api8:2023-define-cors-origin: off
+
+  # We use RFC 9457 429 responses with Retry-After (enforced by owasp:api4:2023-rate-limit-responses-429 and
+  # -retry-after) instead of X-RateLimit-* headers on every success response.
+  owasp:api4:2023-rate-limit: off
+
+overrides:
+  # Intentionally unauthenticated endpoints. Each is protected by a different mechanism.
+  - files:
+      - "agent.openapi.yaml#/paths/~1v1~1pair"            # one-time 128-bit token + HMAC proof bound to TLS channel
+      - "cloud.openapi.yaml#/paths/~1v1~1agents~1enroll"  # one-time 10-minute enrollment code
+    rules:
+      owasp:api2:2023-write-restricted: off
+  - files:
+      - "cloud.openapi.yaml#/paths/~1v1~1legal"   # public legal documents / grievance officer contact
+      - "cloud.openapi.yaml#/paths/~1v1~1config"  # signed public feature flags
+      - "cloud.openapi.yaml#/paths/~1healthz"     # liveness only, no data
+    rules:
+      owasp:api2:2023-read-restricted: off
+      owasp:api8:2023-define-error-responses-401: off
+  # WebSocket upgrade endpoints succeed with 101 Switching Protocols, which is not a 2xx/3xx code.
+  - files:
+      - "cloud.openapi.yaml#/paths/~1v1~1relay~1agent"
+      - "cloud.openapi.yaml#/paths/~1v1~1relay~1tunnel"
+    rules:
+      operation-success-response: off
+  # RelayFrame documents the binary WebSocket framing. No JSON operation references it.
+  - files:
+      - "cloud.openapi.yaml#/components/schemas/RelayFrame"
+    rules:
+      oas3-unused-component: off

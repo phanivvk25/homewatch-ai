@@ -1,5 +1,5 @@
 # ADR-0017: Agent release signing and update policy
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 The requirement is auto-update with signature verification. A container cannot safely replace itself without access to the Docker socket, which equals root on the host. Read-only rootfs and image immutability also argue against in-container self-patching.

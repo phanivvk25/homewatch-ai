@@ -1,5 +1,5 @@
 # ADR-0009: Backend on ASP.NET Core / .NET 10 LTS
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 The brief specifies ASP.NET Core 9. .NET 9 is an STS release whose support **ended in May 2026**. Running unsupported runtimes violates ASVS V14 and our own patch policy. .NET 10 is LTS (supported until November 2028).

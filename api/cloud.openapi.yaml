@@ -1,0 +1,1373 @@
+openapi: 3.1.0
+info:
+  title: Home Network Tracker Cloud API
+  version: 1.0.0
+  summary: Optional accounts, household membership, blind relay and push for remote mode.
+  description: |
+    Hosted in Azure Central India (DR: South India). Used **only** when the owner enables remote mode or push.
+
+    **This API never receives DNS queries, device inventories, sessions or alert contents.** Household data travels
+    end-to-end encrypted (Noise_IK) between app and agent through `/v1/relay/*`, and the relay sees only ciphertext.
+
+    **Authentication**
+    - Apps: OIDC Authorization Code + PKCE (S256) against the issuer at `/.well-known/openid-configuration`.
+      Phone OTP and email OTP are entered on the IdP's hosted pages in the system browser.
+      Access tokens are 10-minute JWTs. Refresh tokens rotate and are sender-constrained with DPoP (RFC 9449).
+      Every request carries both `Authorization: DPoP <token>` and a `DPoP` proof header.
+    - Agents: mutual TLS with a relay-CA client certificate obtained via `/v1/agents/enroll`.
+
+    **Conventions:** RFC 3339 timestamps, RFC 9457 problem details, `Idempotency-Key` on POSTs that create resources,
+    TLS 1.3 only with certificate pinning in the app.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+  contact:
+    name: Home Network Tracker Security
+    url: https://github.com/phanivvk25/homewatch-ai/security/policy
+servers:
+  - url: https://api.{env}.hnt.example.in
+    description: Cloud API per environment (development, staging, production). Placeholder domain; the real domain is set per flavor in build config.
+    variables:
+      env:
+        default: prod
+        enum: [dev, staging, prod]
+    x-internal: false
+security:
+  - oidc: []
+tags:
+  - name: account
+    description: Account, app devices and DPDP data-principal rights
+  - name: households
+    description: Households, members, invitations and agent enrollment
+  - name: agents
+    description: Agent-facing endpoints (mTLS)
+  - name: relay
+    description: WebSocket relay (end-to-end encrypted tunnel)
+  - name: legal
+    description: Consent records, grievances and legal documents
+  - name: meta
+    description: Configuration and health
+
+paths:
+  /v1/me:
+    get:
+      tags: [account]
+      operationId: getAccount
+      summary: Current account
+      responses:
+        '200':
+          description: Account
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Account'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      tags: [account]
+      operationId: updateAccount
+      summary: Correct account details (DPDP right to correction)
+      description: Changing the phone or email starts a re-verification flow on the IdP. The new value takes effect only after OTP verification.
+      parameters:
+        - $ref: '#/components/parameters/DPoP'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: {$ref: '#/components/schemas/AccountUpdate'}
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Account'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [account]
+      operationId: requestAccountErasure
+      summary: Request account erasure (DPDP right to erasure)
+      description: |
+        Immediately disables remote access for households this user owns, revokes all tokens and app devices,
+        and schedules hard deletion after a 30-day recovery window. Consent records keep only a nulled user reference.
+        Data on the home agent is not affected; use the agent's `/v1/data/erase` for that.
+      parameters:
+        - $ref: '#/components/parameters/DPoP'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm: {type: string, const: DELETE}
+                reason: {type: string, maxLength: 500}
+      responses:
+        '202':
+          description: Erasure scheduled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [erasure_due_at]
+                properties:
+                  erasure_due_at: {type: string, format: date-time, maxLength: 35}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/me/erasure/cancel:
+    post:
+      tags: [account]
+      operationId: cancelAccountErasure
+      summary: Cancel a pending erasure within the recovery window
+      responses:
+        '204': {description: "Cancelled"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/me/export:
+    get:
+      tags: [account]
+      operationId: exportAccountData
+      summary: Export all personal data held in the cloud (DPDP right to access)
+      responses:
+        '200':
+          description: Account data export
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccountExport'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/attestation/challenge:
+    post:
+      tags: [account]
+      operationId: createAttestationChallenge
+      summary: Get a nonce for Play Integrity / App Attest
+      responses:
+        '200':
+          description: Challenge
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [nonce, expires_at]
+                properties:
+                  nonce: {type: string, contentEncoding: base64, description: "32 random bytes", maxLength: 64}
+                  expires_at: {type: string, format: date-time, maxLength: 35}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/app-devices:
+    get:
+      tags: [account]
+      operationId: listAppDevices
+      summary: App installations signed in to this account
+      responses:
+        '200':
+          description: App devices
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/AppDevice'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [account]
+      operationId: registerAppDevice
+      summary: Register this app installation (attestation + optional push token)
+      description: |
+        The DPoP key thumbprint in the request must match the DPoP proof on the request.
+        If attestation fails, the device is registered with `attestation_status=failed`. Remote access is then
+        subject to step-up OTP rather than blocked, per the warn-don't-block policy.
+      parameters:
+        - $ref: '#/components/parameters/DPoP'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AppDeviceRegistration'}
+      responses:
+        '201':
+          description: Registered
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AppDevice'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/app-devices/{appDeviceId}:
+    parameters:
+      - name: appDeviceId
+        in: path
+        required: true
+        schema: {type: string, format: uuid, maxLength: 36}
+    patch:
+      tags: [account]
+      operationId: updateAppDevice
+      summary: Update push token or push preference
+      parameters:
+        - $ref: '#/components/parameters/DPoP'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                push_token: {type: [string, 'null'], maxLength: 4096}
+                push_enabled: {type: boolean}
+                locale: {$ref: '#/components/schemas/Locale'}
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AppDevice'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [account]
+      operationId: revokeAppDevice
+      summary: Sign out and revoke an app installation
+      responses:
+        '204': {description: "Revoked"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/households:
+    get:
+      tags: [households]
+      operationId: listHouseholds
+      summary: Households the caller belongs to
+      responses:
+        '200':
+          description: Households
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Household'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [households]
+      operationId: createHousehold
+      summary: Register a household for remote mode (caller becomes owner)
+      description: The `household_id` and `agent_id` come from LAN pairing. The response includes an agent enrollment code valid for 10 minutes.
+      parameters:
+        - $ref: '#/components/parameters/DPoP'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [household_id, agent_id]
+              properties:
+                household_id: {type: string, format: uuid, maxLength: 36}
+                agent_id: {type: string, format: uuid, maxLength: 36}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [household, enrollment]
+                properties:
+                  household: {$ref: '#/components/schemas/Household'}
+                  enrollment: {$ref: '#/components/schemas/AgentEnrollment'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/households/{householdId}:
+    parameters:
+      - $ref: '#/components/parameters/HouseholdId'
+    get:
+      tags: [households]
+      operationId: getHousehold
+      summary: Get a household
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Household
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Household'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [households]
+      operationId: deleteHousehold
+      summary: Disable remote mode and delete all cloud state for the household
+      description: Disconnects the agent, revokes its relay credential, and deletes memberships, invitations and enrollments.
+      x-required-role: owner
+      responses:
+        '204': {description: "Deleted"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/households/{householdId}/members:
+    parameters:
+      - $ref: '#/components/parameters/HouseholdId'
+    get:
+      tags: [households]
+      operationId: listHouseholdMembers
+      summary: List cloud-linked members
+      x-required-role: member
+      responses:
+        '200':
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/HouseholdMember'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/households/{householdId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/HouseholdId'
+      - name: userId
+        in: path
+        required: true
+        schema: {type: string, format: uuid, maxLength: 36}
+    patch:
+      tags: [households]
+      operationId: updateHouseholdMember
+      summary: Change a member's role (member/viewer)
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: {type: string, enum: [member, viewer]}
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HouseholdMember'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [households]
+      operationId: removeHouseholdMember
+      summary: Remove a member (owner), or leave the household (self)
+      x-required-role: viewer
+      responses:
+        '204': {description: "Removed"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/households/{householdId}/invitations:
+    parameters:
+      - $ref: '#/components/parameters/HouseholdId'
+    post:
+      tags: [households]
+      operationId: createInvitation
+      summary: Create a cloud invitation code (embedded in the agent's pairing QR for remote invites)
+      x-required-role: owner
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: {type: string, enum: [member, viewer]}
+      responses:
+        '201':
+          description: Invitation
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Invitation'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/invitations/accept:
+    post:
+      tags: [households]
+      operationId: acceptInvitation
+      summary: Join a household with an invitation code
+      parameters:
+        - $ref: '#/components/parameters/DPoP'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: {type: string, minLength: 16, maxLength: 64}
+      responses:
+        '200':
+          description: Joined
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Household'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '410':
+          description: Code expired or already used
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/households/{householdId}/agent-enrollments:
+    parameters:
+      - $ref: '#/components/parameters/HouseholdId'
+    post:
+      tags: [households]
+      operationId: createAgentEnrollment
+      summary: Issue a new agent enrollment code (e.g. agent replaced or re-installed)
+      description: Any existing agent credential for the household is revoked when the new enrollment is used.
+      x-required-role: owner
+      responses:
+        '201':
+          description: Enrollment code
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AgentEnrollment'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/households/{householdId}/audit:
+    parameters:
+      - $ref: '#/components/parameters/HouseholdId'
+    get:
+      tags: [households]
+      operationId: listHouseholdAudit
+      summary: Cloud audit events for the household (newest first)
+      x-required-role: owner
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Audit events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/AuditEvent'}
+                    maxItems: 200
+                  next_cursor: {type: [string, 'null'], maxLength: 256}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/agents/enroll:
+    post:
+      tags: [agents]
+      operationId: enrollAgent
+      summary: Exchange an enrollment code for a relay client certificate
+      description: |
+        Called by the agent over TLS 1.3 without a client certificate. The code is single-use, expires in 10 minutes,
+        and is bound to the household and agent id. Limited to 5 attempts per code.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enrollment_code, agent_id, csr, version, arch]
+              properties:
+                enrollment_code: {type: string, minLength: 16, maxLength: 64}
+                agent_id: {type: string, format: uuid, maxLength: 36}
+                csr: {type: string, contentEncoding: base64, description: "DER PKCS#10, P-256", maxLength: 8192}
+                version: {type: string, maxLength: 32}
+                arch: {type: string, maxLength: 16}
+      responses:
+        '200':
+          description: Enrolled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AgentCredential'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401':
+          description: Code invalid, expired, used or bound to another agent
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/agents/renew:
+    post:
+      tags: [agents]
+      operationId: renewAgentCredential
+      summary: Renew the agent's relay certificate (allowed in the last third of its lifetime)
+      security:
+        - agentMtls: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csr]
+              properties:
+                csr: {type: string, contentEncoding: base64, maxLength: 8192}
+      responses:
+        '200':
+          description: Renewed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AgentCredential'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/agents/push:
+    post:
+      tags: [agents]
+      operationId: requestPush
+      summary: Ask the backend to notify household members of a new alert
+      description: |
+        The backend sends FCM/APNs messages with payload `{"t":"alert","r":"<alert_ref>"}` and a generic localised
+        notification string to members whose app devices have push enabled. Nothing is persisted beyond rate-limit counters.
+        Limited to 30 per hour per household.
+      security:
+        - agentMtls: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alert_ref]
+              properties:
+                alert_ref:
+                  type: string
+                  pattern: '^[a-z2-7]{26}$'
+                  description: Opaque 128-bit alert reference. Must not encode any household information.
+                  maxLength: 255
+                urgency: {type: string, enum: [normal, high], default: normal}
+              additionalProperties: false
+      responses:
+        '202': {description: "Accepted for delivery"}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/relay/agent:
+    get:
+      tags: [relay]
+      operationId: connectAgentRelay
+      summary: Agent's persistent outbound WebSocket (upgrade)
+      description: |
+        WebSocket subprotocol `hnt-relay.v1`. Binary frames use the `RelayFrame` layout. The agent sends PING every 30 s.
+        Only one connection per agent is allowed; a newer connection replaces the older one and raises an audit event.
+      security:
+        - agentMtls: []
+      parameters:
+        - $ref: '#/components/parameters/Upgrade'
+        - $ref: '#/components/parameters/WsProtocol'
+      responses:
+        '101': {description: "Switching protocols"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '426':
+          description: Upgrade required
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/relay/tunnel:
+    get:
+      tags: [relay]
+      operationId: openTunnel
+      summary: App WebSocket stream to its household agent (upgrade)
+      description: |
+        Requires membership of `household_id`. The relay allocates a stream on the agent's connection and forwards
+        `RelayFrame`s both ways without inspecting them. The first DATA frames carry the Noise_IK handshake. After that,
+        frames carry encrypted HTTP/1.1 messages for the agent local API. Limits: frames are at most 64 KiB, 4 concurrent
+        streams per app device, 15-minute idle timeout. The access token is re-validated every 10 minutes
+        (the client sends `REAUTH` frames).
+      x-required-role: viewer
+      parameters:
+        - name: household_id
+          in: query
+          required: true
+          schema: {type: string, format: uuid, maxLength: 36}
+        - $ref: '#/components/parameters/DPoP'
+        - $ref: '#/components/parameters/Upgrade'
+        - $ref: '#/components/parameters/WsProtocol'
+      responses:
+        '101': {description: "Switching protocols"}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          description: Agent is not connected
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+
+  /v1/consents:
+    get:
+      tags: [legal]
+      operationId: listCloudConsents
+      summary: Consent records held in the cloud for the caller
+      responses:
+        '200':
+          description: Consents
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/ConsentRecord'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [legal]
+      operationId: recordCloudConsent
+      summary: Record a consent decision for cloud processing (remote access, push, crash reports, analytics)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ConsentCreate'}
+      responses:
+        '201':
+          description: Recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ConsentRecord'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/consents/{consentId}/withdraw:
+    parameters:
+      - name: consentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid, maxLength: 36}
+    post:
+      tags: [legal]
+      operationId: withdrawCloudConsent
+      summary: Withdraw a cloud consent
+      description: Withdrawing `remote_access` disables remote mode for households the caller owns. Withdrawing `push_notifications` clears push tokens.
+      responses:
+        '200':
+          description: Withdrawn
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ConsentRecord'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/grievances:
+    get:
+      tags: [legal]
+      operationId: listGrievances
+      summary: Grievances raised by the caller
+      responses:
+        '200':
+          description: Grievances
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Grievance'}
+                    maxItems: 200
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [legal]
+      operationId: createGrievance
+      summary: Raise a grievance with the Grievance Officer (DPDP)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [category, description]
+              properties:
+                category: {type: string, enum: [access, correction, erasure, consent, breach, other]}
+                description: {type: string, minLength: 10, maxLength: 4000}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Grievance'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/grievances/{grievanceId}:
+    parameters:
+      - name: grievanceId
+        in: path
+        required: true
+        schema: {type: string, format: uuid, maxLength: 36}
+    get:
+      tags: [legal]
+      operationId: getGrievance
+      summary: Get a grievance and its status
+      responses:
+        '200':
+          description: Grievance
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Grievance'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/legal:
+    get:
+      tags: [legal]
+      operationId: getLegalInfo
+      summary: Grievance Officer contact and current legal document versions (public)
+      description: Also bundled in the app at build time so it is available in local-only mode. This endpoint provides updates.
+      security: []
+      parameters:
+        - name: lang
+          in: query
+          schema: {$ref: '#/components/schemas/Locale'}
+      responses:
+        '200':
+          description: Legal information
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LegalInfo'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/config:
+    get:
+      tags: [meta]
+      operationId: getRemoteConfig
+      summary: Signed feature flags and minimum supported versions (public)
+      security: []
+      parameters:
+        - name: platform
+          in: query
+          required: true
+          schema: {type: string, enum: [android, ios, agent]}
+        - name: version
+          in: query
+          required: true
+          schema: {type: string, maxLength: 32}
+      responses:
+        '200':
+          description: Remote config
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RemoteConfig'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      tags: [meta]
+      operationId: health
+      summary: Liveness probe (no dependency checks, no data)
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, const: ok}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    oidc:
+      type: openIdConnect
+      openIdConnectUrl: https://id.prod.hnt.example.in/.well-known/openid-configuration
+      description: "Authorization Code + PKCE (S256). DPoP-bound tokens (send `Authorization: DPoP <token>` and a `DPoP` proof header)."
+    agentMtls:
+      type: mutualTLS
+      description: Agent relay client certificate issued by `/v1/agents/enroll`.
+
+  parameters:
+    DPoP:
+      name: DPoP
+      in: header
+      required: true
+      description: RFC 9449 DPoP proof JWT for this request (htm, htu, iat, jti, ath)
+      schema: {type: string, maxLength: 4096}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: {type: string, format: uuid, maxLength: 36}
+    HouseholdId:
+      name: householdId
+      in: path
+      required: true
+      schema: {type: string, format: uuid, maxLength: 36}
+    Cursor:
+      name: cursor
+      in: query
+      schema: {type: string, maxLength: 256}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50, format: int32}
+    Upgrade:
+      name: Upgrade
+      in: header
+      required: true
+      schema: {type: string, const: websocket}
+    WsProtocol:
+      name: Sec-WebSocket-Protocol
+      in: header
+      required: true
+      schema: {type: string, const: hnt-relay.v1}
+
+  responses:
+    BadRequest:
+      description: Validation failed
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Forbidden:
+      description: Caller lacks the required household role
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: Not found (also returned for resources in households the caller is not a member of)
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Conflict:
+      description: Conflicts with current state
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    TooManyRequests:
+      description: Rate limited
+      headers:
+        Retry-After:
+          schema: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+          description: Seconds to wait
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    InternalError:
+      description: Unexpected server error (no internal details are returned)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type: {type: string, format: uri-reference, maxLength: 2048}
+        title: {type: string, maxLength: 255}
+        status: {type: integer, minimum: 400, maximum: 599, format: int32}
+        detail: {type: string, maxLength: 2000}
+        instance: {type: string, maxLength: 255}
+        code: {type: string, maxLength: 255}
+        trace_id: {type: string, description: "Correlation id for support (contains no personal data)", maxLength: 255}
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, code]
+            properties:
+              field: {type: string, maxLength: 255}
+              code: {type: string, maxLength: 255}
+          maxItems: 100
+
+    Locale:
+      type: string
+      enum: [en, hi, te, ta]
+
+    Role:
+      type: string
+      enum: [owner, member, viewer]
+
+    Account:
+      type: object
+      required: [id, phone_masked, phone_verified, locale, status, created_at]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        phone_masked: {type: string, examples: ['+91 ••••••3210'], maxLength: 255}
+        phone_verified: {type: boolean}
+        email_masked: {type: [string, 'null'], examples: ['p•••@example.com'], maxLength: 255}
+        email_verified: {type: boolean}
+        locale: {$ref: '#/components/schemas/Locale'}
+        status: {type: string, enum: [active, pending_erasure, locked]}
+        erasure_due_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+        created_at: {type: string, format: date-time, maxLength: 35}
+
+    AccountUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        locale: {$ref: '#/components/schemas/Locale'}
+        phone_e164:
+          type: string
+          pattern: '^\+[1-9][0-9]{7,14}$'
+          description: Starts re-verification; value applied after OTP
+          maxLength: 255
+        email: {type: string, format: email, maxLength: 254}
+
+    AccountExport:
+      type: object
+      required: [exported_at, account, households, app_devices, consents, grievances]
+      properties:
+        exported_at: {type: string, format: date-time, maxLength: 35}
+        account:
+          type: object
+          required: [id, phone_e164, created_at]
+          properties:
+            id: {type: string, format: uuid, maxLength: 36}
+            phone_e164: {type: string, maxLength: 255}
+            email: {type: [string, 'null'], maxLength: 255}
+            locale: {$ref: '#/components/schemas/Locale'}
+            created_at: {type: string, format: date-time, maxLength: 35}
+        households:
+          type: array
+          items: {$ref: '#/components/schemas/Household'}
+          maxItems: 100
+        app_devices:
+          type: array
+          items: {$ref: '#/components/schemas/AppDevice'}
+          maxItems: 100
+        consents:
+          type: array
+          items: {$ref: '#/components/schemas/ConsentRecord'}
+          maxItems: 100
+        grievances:
+          type: array
+          items: {$ref: '#/components/schemas/Grievance'}
+          maxItems: 100
+        note:
+          type: string
+          description: Explains that household network data is stored only on the home agent and must be exported there
+
+          maxLength: 255
+    AppDeviceRegistration:
+      type: object
+      required: [platform, dpop_jkt, app_version, attestation]
+      properties:
+        platform: {type: string, enum: [android, ios]}
+        dpop_jkt: {type: string, description: "RFC 7638 JWK SHA-256 thumbprint", maxLength: 64}
+        app_version: {type: string, maxLength: 32}
+        locale: {$ref: '#/components/schemas/Locale'}
+        push_token: {type: [string, 'null'], maxLength: 4096}
+        push_enabled: {type: boolean, default: false}
+        attestation:
+          type: object
+          required: [type, token, nonce]
+          properties:
+            type: {type: string, enum: [play_integrity, app_attest, unsupported]}
+            token: {type: string, maxLength: 16384}
+            key_id: {type: string, description: "App Attest key id (iOS)", maxLength: 128}
+            nonce: {type: string, maxLength: 64}
+
+    AppDevice:
+      type: object
+      required: [id, platform, push_enabled, attestation_status, created_at]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        platform: {type: string, enum: [android, ios]}
+        push_enabled: {type: boolean}
+        attestation_status: {type: string, enum: [unverified, passed, failed, unsupported]}
+        last_seen_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+        created_at: {type: string, format: date-time, maxLength: 35}
+        is_current: {type: boolean}
+
+    Household:
+      type: object
+      required: [id, role, remote_enabled, agent]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        role: {$ref: '#/components/schemas/Role'}
+        remote_enabled: {type: boolean}
+        agent:
+          oneOf:
+            - $ref: '#/components/schemas/AgentStatus'
+            - type: 'null'
+        created_at: {type: string, format: date-time, maxLength: 35}
+
+    AgentStatus:
+      type: object
+      required: [id, connected]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        connected: {type: boolean}
+        version: {type: [string, 'null'], maxLength: 255}
+        last_connected_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+
+    HouseholdMember:
+      type: object
+      required: [user_id, role, joined_at]
+      properties:
+        user_id: {type: string, format: uuid, maxLength: 36}
+        role: {$ref: '#/components/schemas/Role'}
+        phone_masked: {type: string, maxLength: 255}
+        joined_at: {type: string, format: date-time, maxLength: 35}
+
+    Invitation:
+      type: object
+      required: [code, role, expires_at]
+      properties:
+        code: {type: string, description: "128-bit, base32. Shown once", maxLength: 255}
+        role: {type: string, enum: [member, viewer]}
+        expires_at: {type: string, format: date-time, maxLength: 35}
+
+    AgentEnrollment:
+      type: object
+      required: [enrollment_code, relay_url, expires_at]
+      properties:
+        enrollment_code: {type: string, description: "Single-use, shown once", maxLength: 255}
+        relay_url: {type: string, format: uri, examples: ['wss://relay.prod.hnt.example.in/v1/relay/agent'], maxLength: 2048}
+        expires_at: {type: string, format: date-time, maxLength: 35}
+
+    AgentCredential:
+      type: object
+      required: [client_cert, ca_chain, not_after, relay_url]
+      properties:
+        client_cert: {type: string, description: "PEM", maxLength: 16384}
+        ca_chain: {type: string, description: "PEM relay CA chain", maxLength: 16384}
+        not_after: {type: string, format: date-time, maxLength: 35}
+        relay_url: {type: string, format: uri, maxLength: 2048}
+
+    RelayFrame:
+      type: object
+      description: |
+        Documentation-only description of the binary WebSocket frame layout (big-endian):
+        `type:u8 | stream_id:u32 | length:u16 | payload[length]`.
+        Types: 0x01 OPEN (relay→agent, payload = requesting app_device_id as 16 bytes), 0x02 DATA (opaque Noise message),
+        0x03 CLOSE (payload = u16 reason), 0x04 PING, 0x05 PONG, 0x06 REAUTH (app→relay, payload = new access token + DPoP proof).
+        The relay reads only type, stream_id and length.
+      required: [type, stream_id, payload]
+      properties:
+        type: {type: string, enum: [open, data, close, ping, pong, reauth]}
+        stream_id: {type: integer, minimum: 0, maximum: 4294967295, format: int32}
+        payload: {type: string, contentEncoding: base64, maxLength: 87384}
+
+    ConsentCreate:
+      type: object
+      required: [purpose, notice_version, language, granted, evidence_sha256]
+      properties:
+        purpose: {type: string, enum: [remote_access, push_notifications, crash_reports, analytics, terms_privacy]}
+        notice_version: {type: string, maxLength: 32}
+        language: {$ref: '#/components/schemas/Locale'}
+        granted: {type: boolean}
+        evidence_sha256: {type: string, contentEncoding: base64, maxLength: 64}
+
+    ConsentRecord:
+      type: object
+      required: [id, purpose, notice_version, language, granted, created_at]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        purpose: {type: string, maxLength: 255}
+        notice_version: {type: string, maxLength: 255}
+        language: {$ref: '#/components/schemas/Locale'}
+        granted: {type: boolean}
+        created_at: {type: string, format: date-time, maxLength: 35}
+        withdrawn_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+
+    Grievance:
+      type: object
+      required: [id, category, status, created_at, due_at]
+      properties:
+        id: {type: string, format: uuid, maxLength: 36}
+        reference: {type: string, examples: ['GRV-2026-000123'], maxLength: 255}
+        category: {type: string, enum: [access, correction, erasure, consent, breach, other]}
+        status: {type: string, enum: [open, in_progress, resolved, rejected]}
+        created_at: {type: string, format: date-time, maxLength: 35}
+        due_at: {type: string, format: date-time, maxLength: 35}
+        resolved_at: {type: [string, 'null'], format: date-time, maxLength: 35}
+        resolution_note: {type: [string, 'null'], maxLength: 4000}
+
+    LegalInfo:
+      type: object
+      required: [grievance_officer, documents]
+      properties:
+        grievance_officer:
+          type: object
+          required: [name, email, address, response_days]
+          properties:
+            name: {type: string, maxLength: 255}
+            email: {type: string, format: email, maxLength: 254}
+            phone: {type: [string, 'null'], maxLength: 255}
+            address: {type: string, maxLength: 500}
+            response_days: {type: integer, format: int32, minimum: 0, maximum: 2147483647}
+        data_protection_board_url: {type: string, format: uri, maxLength: 2048}
+        documents:
+          type: array
+          items:
+            type: object
+            required: [kind, version, language, url, sha256]
+            properties:
+              kind: {type: string, enum: [privacy_policy, terms, consent_notice, network_notice_template]}
+              version: {type: string, maxLength: 255}
+              language: {$ref: '#/components/schemas/Locale'}
+              url: {type: string, format: uri, maxLength: 2048}
+              sha256: {type: string, maxLength: 64}
+          maxItems: 100
+
+    RemoteConfig:
+      type: object
+      required: [payload, signature, key_id]
+      properties:
+        payload:
+          type: object
+          required: [issued_at, expires_at, min_supported_version, flags]
+          properties:
+            issued_at: {type: string, format: date-time, maxLength: 35}
+            expires_at: {type: string, format: date-time, maxLength: 35}
+            min_supported_version: {type: string, maxLength: 255}
+            flags:
+              type: object
+              properties:
+                remote_mode: {type: boolean}
+                alerts: {type: boolean}
+                alerts_adult_category: {type: boolean}
+                doh_block: {type: boolean}
+                dhcp_server: {type: boolean}
+              additionalProperties: {type: boolean}
+        signature: {type: string, contentEncoding: base64, description: "Ed25519 over the canonical JSON (RFC 8785) of payload", maxLength: 128}
+        key_id: {type: string, maxLength: 128}
+
+    AuditEvent:
+      type: object
+      required: [id, ts, actor_type, action]
+      properties:
+        id: {type: string, maxLength: 255}
+        ts: {type: string, format: date-time, maxLength: 35}
+        actor_type: {type: string, enum: [user, agent, system, admin]}
+        actor_id: {type: [string, 'null'], format: uuid, maxLength: 36}
+        action: {type: string, examples: [household.created, member.removed, agent.connected, agent.replaced], maxLength: 255}
+        details: {type: object, additionalProperties: true}

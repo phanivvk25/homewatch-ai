@@ -2,7 +2,7 @@
 
 A privacy-first home network visibility tool for Indian households. You can see which devices are on your Wi-Fi, when each one connected, and which websites (domains) each one looked up.
 
-> **Status:** Architecture proposed and awaiting approval. No code yet.
+> **Status:** Architecture accepted. Data model and API contracts are done; agent implementation is next.
 
 ## Repository layout
 | Path | Contents |
@@ -18,4 +18,6 @@ A privacy-first home network visibility tool for Indian households. You can see 
 - [Architecture](docs/architecture/architecture.md)
 - [Threat model (STRIDE)](docs/security/threat-model.md)
 - [Architecture Decision Records](docs/adr/README.md)
+- [Data model](docs/architecture/data-model.md)
+- [API contracts](api/README.md)
 - [Known limitations](docs/architecture/architecture.md#9-known-limitations)

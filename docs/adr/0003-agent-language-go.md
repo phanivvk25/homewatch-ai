@@ -1,5 +1,5 @@
 # ADR-0003: Agent implemented in Go
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Context
 The agent must run on a Raspberry Pi (arm64/armv7), x86 mini-PCs and NAS boxes, and on OpenWrt routers (aarch64, arm and mipsel, often 128–256 MB RAM). It needs a DNS server, packet capture (ARP/DHCP), mDNS, TLS 1.3 + mTLS, Noise, SQLite and an HTTP API. The p95 DNS overhead must stay under 5 ms.

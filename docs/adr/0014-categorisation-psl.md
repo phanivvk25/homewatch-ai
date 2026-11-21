@@ -1,5 +1,5 @@
 # ADR-0014: Domain grouping (PSL) and offline signed category bundles
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Decision
 - eTLD+1 grouping uses the **Public Suffix List** (`golang.org/x/net/publicsuffix`, plus a bundled newer PSL snapshot). For example, `rr3---sn-x.googlevideo.com` groups under `googlevideo.com`. A curated "brand alias" map (`googlevideo.com`, `ytimg.com` → YouTube) aids readability.

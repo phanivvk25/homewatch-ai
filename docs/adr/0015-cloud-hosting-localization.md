@@ -1,5 +1,5 @@
 # ADR-0015: Azure India regions, regional WAF, Bicep
-**Status:** Proposed · **Date:** 2026-11-21
+**Status:** Accepted · **Date:** 2026-11-21
 
 ## Decision
 - Primary region **Central India (Pune)**, DR region **South India (Chennai)**, both inside India.
